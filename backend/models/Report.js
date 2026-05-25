@@ -4,10 +4,14 @@ const path = require('path');
 const dbPath = process.env.DB_PATH || path.join(__dirname, '..', 'flood.db');
 let db;
 
+// ─── Database Initialization ───
+
 function initDB() {
   try {
     db = new Database(dbPath);
     db.pragma('journal_mode = WAL');
+    db.pragma('foreign_keys = ON');
+
     db.exec(`
       CREATE TABLE IF NOT EXISTS reports (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -25,14 +29,33 @@ function initDB() {
         created_at TEXT DEFAULT (datetime('now'))
       )
     `);
+
+    // Index for spatial queries
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_reports_coords
+      ON reports(latitude, longitude)
+    `);
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_reports_created
+      ON reports(created_at DESC)
+    `);
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_reports_verified
+      ON reports(verified)
+    `);
+
     const count = db.prepare('SELECT COUNT(*) as c FROM reports').get().c;
     if (count === 0) seedData();
-    console.log(`Database ready (${count} reports)`);
+
+    console.log(`✅ Database ready (${count} reports)`);
   } catch (e) {
-    console.error('Database init failed:', e.message);
-    process.exit(1);
+    console.error('❌ Database init failed:', e.message);
+    if (process.env.NODE_ENV !== 'test') process.exit(1);
+    throw e;
   }
 }
+
+// ─── Seed Data ───
 
 function seedData() {
   const reports = [
@@ -57,35 +80,89 @@ function seedData() {
   db.transaction((items) => {
     for (const r of items) stmt.run(r.lat, r.lng, r.loc, r.depth, r.desc, r.verified);
   })(reports);
-  console.log(`Seeded ${reports.length} reports`);
+  console.log(`📦 Seeded ${reports.length} sample reports`);
 }
 
+// ─── CRUD Operations ───
+
+/**
+ * Create a new report.
+ */
 function createReport(fields) {
   const stmt = db.prepare(
     `INSERT INTO reports (latitude, longitude, location_name, water_depth, description, image_url, exif_data, photo_taken_at, gps_accuracy, device_info)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   );
   const info = stmt.run(
-    fields.latitude, fields.longitude, fields.location_name || '',
+    fields.latitude,
+    fields.longitude,
+    fields.location_name || '',
     Math.max(0, parseInt(fields.water_depth, 10) || 0),
-    fields.description || '', fields.imageUrl,
-    fields.exifData || null, fields.photoTakenAt || null,
-    fields.gpsAccuracy || 0, fields.deviceInfo || null
+    fields.description || '',
+    fields.imageUrl || null,
+    fields.exifData || null,
+    fields.photoTakenAt || null,
+    fields.gpsAccuracy || 0,
+    fields.deviceInfo || null
   );
   return db.prepare('SELECT * FROM reports WHERE id = ?').get(info.lastInsertRowid);
 }
 
-function getAllReports(page = 1, limit = 50) {
+/**
+ * Get all reports with optional filters and pagination.
+ * @param {number} page
+ * @param {number} limit
+ * @param {object} filters - { verified, minDepth, maxDepth, search }
+ */
+function getAllReports(page = 1, limit = 50, filters = {}) {
   const offset = Math.max(0, (page - 1) * limit);
-  const total = db.prepare('SELECT COUNT(*) as c FROM reports').get().c;
-  const rows = db.prepare('SELECT * FROM reports ORDER BY created_at DESC LIMIT ? OFFSET ?').all(limit, offset);
-  return { rows, total, page, limit, pages: Math.ceil(total / limit) };
+  const conditions = [];
+  const params = [];
+
+  if (filters.verified !== undefined) {
+    conditions.push('verified = ?');
+    params.push(filters.verified);
+  }
+  if (filters.minDepth !== undefined) {
+    conditions.push('water_depth >= ?');
+    params.push(filters.minDepth);
+  }
+  if (filters.maxDepth !== undefined) {
+    conditions.push('water_depth <= ?');
+    params.push(filters.maxDepth);
+  }
+  if (filters.search) {
+    conditions.push('(location_name LIKE ? OR description LIKE ?)');
+    params.push(`%${filters.search}%`, `%${filters.search}%`);
+  }
+
+  const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
+
+  const total = db.prepare(`SELECT COUNT(*) as c FROM reports ${whereClause}`).get(...params).c;
+  const rows = db.prepare(
+    `SELECT * FROM reports ${whereClause} ORDER BY created_at DESC LIMIT ? OFFSET ?`
+  ).all(...params, limit, offset);
+
+  return {
+    rows,
+    total,
+    page,
+    limit,
+    pages: Math.max(1, Math.ceil(total / limit)),
+    hasMore: offset + limit < total,
+  };
 }
 
+/**
+ * Get a single report by ID.
+ */
 function getReport(id) {
   return db.prepare('SELECT * FROM reports WHERE id = ?').get(id);
 }
 
+/**
+ * Get aggregate statistics.
+ */
 function getStats() {
   const total = db.prepare('SELECT COUNT(*) as value FROM reports').get().value;
   const verified = db.prepare('SELECT COUNT(*) as value FROM reports WHERE verified = 1').get().value;
@@ -95,35 +172,85 @@ function getStats() {
   const recent = db.prepare('SELECT * FROM reports ORDER BY created_at DESC LIMIT 5').all();
   const byLocation = db.prepare(`
     SELECT location_name, COUNT(*) as count, ROUND(AVG(water_depth), 1) as avg_depth
-    FROM reports WHERE location_name IS NOT NULL AND location_name != ''
-    GROUP BY location_name ORDER BY count DESC LIMIT 10
+    FROM reports
+    WHERE location_name IS NOT NULL AND location_name != ''
+    GROUP BY location_name
+    ORDER BY count DESC
+    LIMIT 10
   `).all();
+
   return { total, verified, avgDepth, maxDepth, today, recent, byLocation };
 }
 
+/**
+ * Update verification status of a report.
+ */
 function updateVerification(id, verified) {
   db.prepare('UPDATE reports SET verified = ? WHERE id = ?').run(verified ? 1 : 0, id);
   return getReport(id);
 }
 
+/**
+ * Delete a report by ID.
+ */
+function deleteReport(id) {
+  db.prepare('DELETE FROM reports WHERE id = ?').run(id);
+}
+
+/**
+ * Find nearby reports within a radius (in meters).
+ * Uses bounding box approximation + Haversine filtering.
+ */
 function findNearbyReports(lat, lng, radiusMeters = 50) {
   const deg = radiusMeters / 111320;
   const cosLat = Math.max(0.01, Math.cos(Math.abs(lat) * Math.PI / 180));
   const lngDeg = radiusMeters / (111320 * cosLat);
+
   const rows = db.prepare(`
     SELECT *, (
       (latitude - ?) * (latitude - ?) +
       (longitude - ?) * (longitude - ?) * ? * ?
     ) as dist_sq
     FROM reports
-    WHERE latitude BETWEEN ? AND ? AND longitude BETWEEN ? AND ?
-    ORDER BY dist_sq ASC LIMIT 5
+    WHERE latitude BETWEEN ? AND ?
+      AND longitude BETWEEN ? AND ?
+    ORDER BY dist_sq ASC
+    LIMIT 5
   `).all(lat, lat, lng, lng, cosLat, cosLat,
-    lat - deg, lat + deg, lng - lngDeg, lng + lngDeg
+    lat - deg, lat + deg,
+    lng - lngDeg, lng + lngDeg
   );
+
   return rows
-    .map(r => ({ ...r, distance_m: Math.round(Math.sqrt(r.dist_sq) * 111320) }))
+    .map(r => ({
+      ...r,
+      distance_m: Math.round(Math.sqrt(r.dist_sq) * 111320),
+    }))
     .filter(r => r.distance_m <= radiusMeters);
 }
 
-module.exports = { initDB, createReport, getAllReports, getReport, getStats, updateVerification, findNearbyReports };
+/**
+ * Get reports within a bounding box (for efficient map rendering).
+ */
+function getReportsInBBox(bbox) {
+  const { south, west, north, east } = bbox;
+  return db.prepare(`
+    SELECT id, latitude, longitude, location_name, water_depth, verified, image_url, created_at
+    FROM reports
+    WHERE latitude BETWEEN ? AND ?
+      AND longitude BETWEEN ? AND ?
+    ORDER BY created_at DESC
+  `).all(south, north, west, east);
+}
+
+module.exports = {
+  initDB,
+  createReport,
+  getAllReports,
+  getReport,
+  getStats,
+  updateVerification,
+  deleteReport,
+  findNearbyReports,
+  getReportsInBBox,
+};
