@@ -1,9 +1,10 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
 import { Modal, Button, Spinner, Alert, Badge, Form, ProgressBar } from 'react-bootstrap';
 import CameraCapture from './CameraCapture';
 import axios from 'axios';
-
-const BASE = process.env.REACT_APP_API_URL || 'http://localhost:4000';
+import exifr from 'exifr';
+import { detectFloodWater, checkAuthenticity } from '../services/vision';
+import { API_BASE } from '../constants';
 
 function detectDeviceInfo() {
   const info = { platform: navigator.platform || '', language: navigator.language, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, screen: `${screen.width}x${screen.height}`, cores: navigator.hardwareConcurrency || 0, connection: '' };
@@ -12,7 +13,7 @@ function detectDeviceInfo() {
 }
 
 async function uploadReport(fd, onProgress) {
-  const res = await axios.post(BASE + '/api/reports', fd, {
+  const res = await axios.post(API_BASE + '/api/reports', fd, {
     headers: { 'Content-Type': 'multipart/form-data' },
     onUploadProgress: onProgress,
   });
@@ -20,7 +21,7 @@ async function uploadReport(fd, onProgress) {
 }
 
 async function checkNearby(lat, lng) {
-  const res = await axios.get(BASE + '/api/reports/nearby', { params: { lat, lng, radius: 50 } });
+  const res = await axios.get(API_BASE + '/api/reports/nearby', { params: { lat, lng, radius: 50 } });
   return res.data;
 }
 
@@ -36,6 +37,11 @@ function ReportForm({ onClose, onSubmitSuccess }) {
   const [gps, setGps] = useState(null);
   const [showCamera, setShowCamera] = useState(false);
   const [deviceInfo] = useState(detectDeviceInfo);
+  const [validation, setValidation] = useState(null);
+
+  useEffect(() => {
+    return () => { if (preview) URL.revokeObjectURL(preview); };
+  }, [preview]);
 
   const startGps = useCallback(() => {
     if (!navigator.geolocation) { setError('Geolokasi tidak didukung'); return; }
@@ -47,11 +53,34 @@ function ReportForm({ onClose, onSubmitSuccess }) {
   }, []);
 
   const handleCapture = useCallback(async (file) => {
+    if (preview) URL.revokeObjectURL(preview);
     setPhoto(file);
     setPreview(URL.createObjectURL(file));
     setShowCamera(false);
     setStep(2);
-  }, []);
+
+    // Run vision validation
+    const [floodResult, authResult] = await Promise.all([
+      detectFloodWater(file),
+      checkAuthenticity(file, null),
+    ]);
+    setValidation({ flood: floodResult, auth: authResult });
+  }, [preview]);
+
+  const handleFilePick = useCallback(async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (preview) URL.revokeObjectURL(preview);
+    setPhoto(file);
+    setPreview(URL.createObjectURL(file));
+    setStep(2);
+
+    const [floodResult, authResult] = await Promise.all([
+      detectFloodWater(file),
+      checkAuthenticity(file, null),
+    ]);
+    setValidation({ flood: floodResult, auth: authResult });
+  }, [preview]);
 
   const handleSubmit = async () => {
     if (!gps || !photo) return;
@@ -60,11 +89,22 @@ function ReportForm({ onClose, onSubmitSuccess }) {
       const fd = new FormData();
       fd.append('latitude', gps.lat);
       fd.append('longitude', gps.lng);
+      fd.append('gps_accuracy', String(Math.round(gps.accuracy || 0)));
       fd.append('location_name', `Lokasi (${gps.lat.toFixed(4)}, ${gps.lng.toFixed(4)})`);
-      fd.append('water_depth', String(Math.max(0, Math.min(500, parseInt(waterDepth) || 0))));
+      fd.append('water_depth', String(Math.max(0, Math.min(500, parseInt(waterDepth, 10) || 0))));
       fd.append('description', description.trim().slice(0, 1000));
       fd.append('photo', photo);
       fd.append('device_info', JSON.stringify(deviceInfo));
+
+      // Extract and send EXIF
+      try {
+        const exif = await exifr.parse(photo, ['Make', 'Model', 'DateTimeOriginal']);
+        if (exif) {
+          fd.append('exif_data', JSON.stringify({ Make: exif.Make, Model: exif.Model }));
+          if (exif.DateTimeOriginal) fd.append('photo_taken_at', new Date(exif.DateTimeOriginal).toISOString());
+        }
+      } catch {}
+
       await uploadReport(fd, (e) => { if (e.total > 0) setUploadProgress(Math.round((e.loaded / e.total) * 100)); });
       if (onSubmitSuccess) onSubmitSuccess();
       onClose();
@@ -72,6 +112,21 @@ function ReportForm({ onClose, onSubmitSuccess }) {
       setError(err.response?.data?.error || 'Gagal mengirim laporan');
     } finally { setLoading(false); setUploadProgress(0); }
   };
+
+  const validationBadge = validation ? (
+    <div className="small mb-2">
+      {validation.flood.isWater ? (
+        <Badge bg="success" className="me-1">✅ Air terdeteksi ({validation.flood.confidence}%)</Badge>
+      ) : (
+        <Badge bg="warning" text="dark" className="me-1">⚠️ Air tidak terdeteksi</Badge>
+      )}
+      {validation.auth.isAuthentic ? (
+        <Badge bg="success">✅ Foto asli ({validation.auth.score}%)</Badge>
+      ) : (
+        <Badge bg="warning" text="dark">⚠️ Foto perlu diperiksa ({validation.auth.score}%)</Badge>
+      )}
+    </div>
+  ) : null;
 
   return (
     <Modal show centered onHide={onClose} backdrop="static" size="md">
@@ -101,18 +156,32 @@ function ReportForm({ onClose, onSubmitSuccess }) {
             {showCamera ? (
               <CameraCapture onCapture={handleCapture} onCancel={() => setShowCamera(false)} />
             ) : (
-              <div className={`rounded p-3 mb-2 text-center border-2 ${photo ? 'bg-light' : 'border-primary'}`}
-                style={{ border: photo ? '1px solid #dee2e6' : '2px dashed #0d6efd', cursor: photo ? 'default' : 'pointer', background: photo ? '#f8f9fa' : '#f0f4ff' }}
-                onClick={() => !photo && setShowCamera(true)}>
-                {!photo ? (
-                  <><div className="fs-1 mb-1">📸</div><div className="fw-semibold text-primary">Ambil Foto Genangan</div><small className="text-muted d-block">Tap untuk membuka kamera</small></>
-                ) : (
-                  <div className="position-relative d-inline-block w-100">
-                    <img src={preview} alt="preview" className="w-100 rounded" style={{ maxHeight: 200, objectFit: 'cover' }} />
-                    <Badge bg="dark" className="position-absolute top-0 end-0 m-1 opacity-75" style={{ cursor: 'pointer' }}
-                      onClick={() => { setPhoto(null); setPreview(null); setStep(1); }}>📷 Ambil ulang</Badge>
+              <div>
+                <div className={`rounded p-3 mb-2 text-center border-2 ${photo ? 'bg-light' : 'border-primary'}`}
+                  style={{ border: photo ? '1px solid #dee2e6' : '2px dashed #0d6efd', cursor: photo ? 'default' : 'pointer', background: photo ? '#f8f9fa' : '#f0f4ff' }}>
+                  {!photo ? (
+                    <div onClick={() => setShowCamera(true)}>
+                      <div className="fs-1 mb-1">📸</div>
+                      <div className="fw-semibold text-primary">Ambil Foto Genangan</div>
+                      <small className="text-muted d-block">Tap untuk membuka kamera</small>
+                    </div>
+                  ) : (
+                    <div className="position-relative d-inline-block w-100">
+                      <img src={preview} alt="preview" className="w-100 rounded" style={{ maxHeight: 200, objectFit: 'cover' }} />
+                      <Badge bg="dark" className="position-absolute top-0 end-0 m-1 opacity-75" style={{ cursor: 'pointer' }}
+                        onClick={() => { if (preview) URL.revokeObjectURL(preview); setPhoto(null); setPreview(null); setValidation(null); setStep(1); }}>📷 Ambil ulang</Badge>
+                    </div>
+                  )}
+                </div>
+                {!photo && (
+                  <div className="text-center">
+                    <label className="btn btn-outline-secondary btn-sm">
+                      📁 Pilih dari galeri
+                      <input type="file" accept="image/*" className="d-none" onChange={handleFilePick} />
+                    </label>
                   </div>
                 )}
+                {validationBadge}
               </div>
             )}
           </>
@@ -120,6 +189,7 @@ function ReportForm({ onClose, onSubmitSuccess }) {
 
         {step === 2 && (
           <>
+            {validationBadge}
             <Form.Group className="mb-3">
               <Form.Label className="fw-semibold small mb-1">💧 Perkiraan Kedalaman Air (cm)</Form.Label>
               <div className="d-flex align-items-center gap-3">

@@ -16,3 +16,4 @@ Thumbs.db
 .cache/
 uploads/
 flood.db*
+frontend/build/

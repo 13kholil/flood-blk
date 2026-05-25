@@ -5,29 +5,33 @@ const dbPath = process.env.DB_PATH || path.join(__dirname, '..', 'flood.db');
 let db;
 
 function initDB() {
-  db = new Database(dbPath);
-  db.pragma('journal_mode = WAL');
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS reports (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      latitude REAL NOT NULL,
-      longitude REAL NOT NULL,
-      location_name TEXT DEFAULT '',
-      water_depth INTEGER DEFAULT 0,
-      description TEXT DEFAULT '',
-      image_url TEXT,
-      verified INTEGER DEFAULT 0,
-      exif_data TEXT,
-      photo_taken_at TEXT,
-      gps_accuracy REAL DEFAULT 0,
-      device_info TEXT,
-      created_at TEXT DEFAULT (datetime('now'))
-    )
-  `);
-
-  const count = db.prepare('SELECT COUNT(*) as c FROM reports').get().c;
-  if (count === 0) seedData();
-  console.log(`Database ready (${count} reports)`);
+  try {
+    db = new Database(dbPath);
+    db.pragma('journal_mode = WAL');
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS reports (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        latitude REAL NOT NULL,
+        longitude REAL NOT NULL,
+        location_name TEXT DEFAULT '',
+        water_depth INTEGER DEFAULT 0,
+        description TEXT DEFAULT '',
+        image_url TEXT,
+        verified INTEGER DEFAULT 0,
+        exif_data TEXT,
+        photo_taken_at TEXT,
+        gps_accuracy REAL DEFAULT 0,
+        device_info TEXT,
+        created_at TEXT DEFAULT (datetime('now'))
+      )
+    `);
+    const count = db.prepare('SELECT COUNT(*) as c FROM reports').get().c;
+    if (count === 0) seedData();
+    console.log(`Database ready (${count} reports)`);
+  } catch (e) {
+    console.error('Database init failed:', e.message);
+    process.exit(1);
+  }
 }
 
 function seedData() {
@@ -63,7 +67,7 @@ function createReport(fields) {
   );
   const info = stmt.run(
     fields.latitude, fields.longitude, fields.location_name || '',
-    Math.max(0, parseInt(fields.water_depth) || 0),
+    Math.max(0, parseInt(fields.water_depth, 10) || 0),
     fields.description || '', fields.imageUrl,
     fields.exifData || null, fields.photoTakenAt || null,
     fields.gpsAccuracy || 0, fields.deviceInfo || null
