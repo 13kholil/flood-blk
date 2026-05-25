@@ -10,7 +10,7 @@ Aplikasi berbasis web yang memungkinkan warga melaporkan genangan banjir secara 
 
 | Fitur | Deskripsi |
 |-------|-----------|
-| 🗺️ **Peta Interaktif** | Peta banjir real-time dengan marker per lokasi, warna marker menunjukkan kedalaman air |
+| 🗺️ **Peta Interaktif** | Peta Leaflet + OSM dengan marker cluster, zona banjir poligon, layer control, legend, locate button |
 | 📸 **Lapor Banjir** | Form 3 langkah: GPS → Kamera → Input detail (kedalaman + deskripsi) |
 | 🤖 **Validasi Vision** | Deteksi genangan air via analisis pixel HSV + cek keaslian foto (client-side, gratis) |
 | 📍 **Cek Duplikat** | Otomatis cek laporan dalam radius 50m menggunakan rumus Haversine |
@@ -30,7 +30,7 @@ Aplikasi berbasis web yang memungkinkan warga melaporkan genangan banjir secara 
 │  Port 3000                           │
 │  ┌────────┐ ┌────────┐ ┌────────┐   │
 │  │  Peta  │ │Laporan │ │Dashboard│   │
-│  │MapLibre│ │  Form  │ │  BMKG   │   │
+│  │ Leaflet│ │  Form  │ │  BMKG   │   │
 │  └────────┘ └────────┘ └────────┘   │
 │         ↕ Socket.IO / REST           │
 ├─────────────────────────────────────┤
@@ -47,7 +47,8 @@ Aplikasi berbasis web yang memungkinkan warga melaporkan genangan banjir secara 
 
 **Frontend:**
 - React 18, React Bootstrap, Bootstrap 5
-- MapLibre GL JS (peta open-source)
+- Leaflet + Leaflet.markercluster (peta interaktif, clustering, layer control)
+- OpenStreetMap tiles (basemap gratis)
 - Axios (HTTP client), Socket.IO Client
 - Canvas API + HSV analysis (computer vision)
 - EXIF Reader (metadata foto)
